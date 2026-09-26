@@ -51,6 +51,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # which qwen4exp has in place of a final norm; it is unindexed in the
         # checkpoint and per-block in the GGUF
         name, gen = item
+        # Normalize multimodal source names before the Qwen4Exp-specific checks,
+        # just as ModelBase.filter_tensors does for the common mappings.
+        name = name.replace("language_model.", "")
+        # The standalone head still uses the trunk's final hyper-connection mixer.
+        # _QwenMtpMixin's generic whitelist only knows norm/embedding/lm_head.
+        if cls.mtp_only and name in (
+            "model.hyper_connection_mixer.hc_norm.weight",
+            "model.hyper_connection_mixer.input_mix_weight_down.weight",
+            "model.hyper_connection_mixer.input_mix_weight_up.weight",
+        ):
+            return name, gen
         if name.startswith("model." + cls._MTP_MIXER_PREFIX):
             name = name.replace("model.", "", 1)
         if name.startswith(cls._MTP_MIXER_PREFIX):
