@@ -1,0 +1,20 @@
+{
+  "purpose": "Review integration of the finite IQ3_S experiment; not a deployed runtime or a benchmark of this merged tree.",
+  "fork_main": "3430447a5fddded9c6d0d8cdc714fdb51c04fab5",
+  "tested_parent": "4f4a9158e76649cbd11d61450476713f6e5fcc31",
+  "common_ancestor": "2cb16936b5d081a92f1d0369954561efb6d1e2c7",
+  "main_changed_files_since_test_base": 516,
+  "retained_changes": [
+    "Standalone draft path and shared output conversion",
+    "Meta backend compute headroom 64",
+    "Qwen4Exp TP graph placement",
+    "CUDA graph cache cap512",
+    "Adapted QSA MTP and draft-owned mixer",
+    "Empty recurrent rollback and graph reservation fix"
+  ],
+  "conflict_resolution": "Three conflicts in qwen4exp.cpp: retain required draft-owned mixer and compression assertion from tested feature port rather than main optional trunk fallback. Other main optimizations retained by three-way merge.",
+  "scope": "Adapted feature backport of29761 using existing QSA helper. Does not include29751,29805,29819 or claim latest upstream parity.",
+  "benchmark_reference": "http://10.1.0.154:8090/iq3s-tp-mtp-20261001/",
+  "validation_at_commit": "Three standalone converter tests passed; git diff --check passed. Isolated CUDA/NCCL build and additional validation pending; see external integration state.",
+  "caution": "The measured quality/performance applies to tested_parent, not this newer merged revision."
+}

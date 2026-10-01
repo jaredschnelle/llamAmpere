@@ -279,12 +279,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        // graph_mtp prefers these when present and falls back to the trunk's own
-        // model.hc_head_*. A draft-only export has no trunk, so this is the only mixer it
-        // has; a full export normally shares the trunk's and leaves these absent.
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        // Upstream #29761: the trained draft has its own final hyper-connection mixer.
+        // Required when MTP is loaded; do not silently substitute the trunk mixer.
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
 
         // qwen4exp sets mtp_use_dedicated_embeddings=false, so these are absent and the
         // head falls back to the trunk's embedding table and LM head
@@ -416,6 +415,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
+    // Keep hc_init in the first device graph split (upstream PR #28569).
+    ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
@@ -514,10 +515,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 // reusing the trunk's LM head. The wide post-block residual is exported as t_h_nextn so the
 // speculative driver can feed it straight back in for the next draft step.
 //
-// v1 simplification: the block attends densely. The trunk's QSA only prunes context past a
-// 2048-token budget, so dense is a numerical superset; drafts are verified by the target
-// either way. The indexer tensors are still loaded so the GGUF stays complete.
-// TODO: wire up QSA here for long-context draft fidelity.
+// Adapted from upstream #29761: QSA draft attention and the draft-owned mixer.
+// Use this fork's existing QSA helpers, retaining its trunk graph and Ampere kernels.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
@@ -534,16 +533,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
-    // The MTP head's final mixer is normally the trunk's own output_hc_* (model.hc_head_*):
-    // upstream trains one hc mixer, shared between the trunk's last layer and the draft head.
-    // A draft-only export has no trunk to share with, so it carries its own
-    // blk.N.nextn.hc_head_* instead. Prefer that when it is there, the same way the LM head
-    // is chosen further down. Without this an MTP-only file loads (trunk_flags makes the
-    // trunk mixer optional for it) and then aborts here.
-    ggml_tensor * mtp_hc_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
-    ggml_tensor * mtp_hc_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
-    ggml_tensor * mtp_hc_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
-    GGML_ASSERT(mtp_hc_norm && "QWEN4EXP MTP: no output mixer (neither nextn.hc_head_norm nor model.hc_head_norm)");
+    GGML_ASSERT(layer.nextn.hc_head_norm && layer.nextn.hc_head_down && layer.nextn.hc_head_up &&
+            "QWEN4EXP MTP: missing draft-owned hyper-connection mixer");
+    GGML_ASSERT(hparams.dsv4_compress_ratios[il] > 0 &&
+            "QWEN4EXP MTP: re-export draft with QSA compression metadata");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -579,7 +572,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    auto * inp_hyb = build_inp_mem_hybrid();
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
+    // As in the trunk, init_full() reservation has no per-batch indexer context.
+    // Actual batches get an indexer context from the draft memory's layer filter.
+    if (mctx_hyb->get_idx()) {
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv());
+    }
+    // The empty recurrent component still provides this scheduler input.
+    ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
@@ -616,57 +617,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
-    // ---- dense attention, mirroring the trunk's full-attention branch ----
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
-    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
-    cb(Qcur_full, "mtp_Qcur_full", il);
-
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "mtp_Qcur_normed", il);
-
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
-
-    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
-
-    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
-
-    // IMRoPE, same convention and freq_base as the trunk
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    cb(Qcur, "mtp_Qcur", il);
-    cb(Kcur, "mtp_Kcur", il);
-
-    const float kq_scale = hparams.f_attention_scale == 0.0f
-            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "mtp_attn_pregate", il);
-
-    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-    cb(cur, "mtp_attn_gated", il);
-
-    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+    // Reuse the trunk's QSA implementation, including indexer projection/cache and sparse mask.
+    cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
     cb(cur, "mtp_attn_out", il);
 
     res_hc = build_hc_combine(res_hc, cur, inject, il);
@@ -698,11 +650,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
 
-    // the trunk's own output mixer, or the head's private copy for a draft-only export
-    // -- chosen above
     cur = build_hc_mix(res_hc,
-            mtp_hc_norm, mtp_hc_down, mtp_hc_up,
-            nullptr, nullptr, -1);
+            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
+            nullptr, nullptr, il);
     cb(cur, "mtp_hc_head", -1);
 
     // deliberately no res->t_embd: it would be n_embd wide while the context sizes its
