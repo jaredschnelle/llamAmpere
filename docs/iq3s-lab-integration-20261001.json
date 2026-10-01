@@ -15,6 +15,7 @@
   "conflict_resolution": "Three conflicts in qwen4exp.cpp: retain required draft-owned mixer and compression assertion from tested feature port rather than main optional trunk fallback. Other main optimizations retained by three-way merge.",
   "scope": "Adapted feature backport of29761 using existing QSA helper. Does not include29751,29805,29819 or claim latest upstream parity.",
   "benchmark_reference": "http://10.1.0.154:8090/iq3s-tp-mtp-20261001/",
-  "validation_at_commit": "Three standalone converter tests passed; git diff --check passed. Isolated CUDA/NCCL build and additional validation pending; see external integration state.",
-  "caution": "The measured quality/performance applies to tested_parent, not this newer merged revision."
+  "validation_at_commit": "Isolated sm86 CUDA/NCCL build passed; three selected CTest suites and three converter tests passed; eight matched uncached/untruncated TP requests, vision orientation and 32K retrieval passed; artifact hashes and loaded NCCL verified; baseline API restored. Full GPU operator sweep and full quality suite were not rerun on merged code.",
+  "caution": "The measured quality/performance applies to tested_parent, not this newer merged revision.",
+  "validated_runtime_commit": "fcf93ad87eeb9a66f1e82e64722ac22250f1783a"
 }
