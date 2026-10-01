@@ -569,8 +569,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     auto * inp_hyb = build_inp_mem_hybrid();
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
-    GGML_ASSERT(mctx_hyb->get_idx() && "QWEN4EXP MTP requires an indexer cache");
-    GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv());
+    // As in the trunk, init_full() reservation has no per-batch indexer context.
+    // Actual batches get an indexer context from the draft memory's layer filter.
+    if (mctx_hyb->get_idx()) {
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv());
+    }
     // The empty recurrent component still provides this scheduler input.
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
