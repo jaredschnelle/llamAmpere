@@ -38,7 +38,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_map: np.memmap | None = None
         self._ple_path: Path | None = None
 
-    # The MTP head is one trunk-shaped block (dense attention + MoE, wrapped in
+    # The MTP head is one trunk-shaped block (QSA attention + MoE, wrapped in
     # hyper-connections) plus a combiner, so once _QwenMtpMixin renames
     # `mtp.layers.0.*` to the trailing block index its tensors ride the existing
     # qwen4exp mappings unchanged. Only the two head-level pieces below differ.
@@ -123,9 +123,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
         ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        # llama.cpp reads this array with length block_count, and the MTP blocks
-        # trailing the trunk attend densely, which is what a ratio of 0 selects
-        ratios += [0] * (self.block_count - n_layer)
+        # Upstream #29761: the trailing MTP block uses the same QSA compression ratio.
+        ratios += [ratio] * (self.block_count - n_layer)
         self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,

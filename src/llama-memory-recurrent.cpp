@@ -163,6 +163,11 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // A QSA MTP context retains the hybrid wrapper with no recurrent tensors.
+    if (ctxs_bufs.empty()) {
+        n_rs_seq = 0;
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -257,6 +262,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq), or (gdn_replay)
             // via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                if (ctxs_bufs.empty()) {
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // RB1b: n_rs_seq is the ring capacity, not the number of slots this sequence has
                 // actually filled. Bound the request by what was really written, and compose with
